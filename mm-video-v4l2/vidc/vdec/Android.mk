@@ -96,7 +96,7 @@ libmm-vdec-inc += $(call project-path-for,qcom-media)/libstagefrighthw
 endif
 
 # Common Dependencies
-libmm-vdec-add-dep := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
+LOCAL_HEADER_LIBRARIES  := generated_kernel_headers
 
 ifeq ($(call is-platform-sdk-version-at-least, 19),true)
 # This feature is enabled for Android KK+
@@ -140,7 +140,8 @@ LOCAL_HEADER_LIBRARIES := \
         libnativebase_headers \
         libutils_headers \
         libhardware_headers \
-        display_headers
+        display_headers \
+	generated_kernel_headers
 
 LOCAL_C_INCLUDES                += $(libmm-vdec-inc)
 LOCAL_ADDITIONAL_DEPENDENCIES   := $(libmm-vdec-add-dep)
@@ -179,7 +180,8 @@ LOCAL_HEADER_LIBRARIES := \
         media_plugin_headers \
         libnativebase_headers \
         libutils_headers \
-        libhardware_headers
+        libhardware_headers \
+	generated_kernel_headers
 
 LOCAL_C_INCLUDES              += $(libmm-vdec-inc)
 LOCAL_ADDITIONAL_DEPENDENCIES := $(libmm-vdec-add-dep)
