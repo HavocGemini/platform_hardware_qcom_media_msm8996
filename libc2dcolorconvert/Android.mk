@@ -14,6 +14,10 @@ LOCAL_HEADER_LIBRARIES := \
         libhardware_headers \
 	generated_kernel_headers
 
+ifeq ($(TARGET_BOARD_AUTO),true)
+LOCAL_CFLAGS := -DSUPPORT_SECURE_C2D
+endif
+
 LOCAL_SHARED_LIBRARIES := liblog libdl
 
 LOCAL_MODULE_TAGS := optional
