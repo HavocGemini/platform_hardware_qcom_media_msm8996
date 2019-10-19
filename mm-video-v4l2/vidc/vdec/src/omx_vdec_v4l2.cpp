@@ -256,6 +256,11 @@ void* async_message_thread (void *input)
                 }
                 if(ptr[2] & V4L2_EVENT_PICSTRUCT_FLAG) {
                     omx->m_progressive = ptr[4];
+#ifdef _MSM8996_AUTO_
+                    vdec_msg.msgdata.output_frame.interlaced_format =
+                      omx->m_progressive ? VDEC_InterlaceFrameProgressive : VDEC_InterlaceInterleaveFrameTopFieldFirst;
+#endif
+
                     DEBUG_PRINT_HIGH("VIDC Port Reconfig PicStruct change - %d", ptr[4]);
                 }
                 if(ptr[2] & V4L2_EVENT_COLOUR_SPACE_FLAG) {
@@ -362,45 +367,19 @@ void* async_message_thread (void *input)
 void* message_thread_dec(void *input)
 {
     omx_vdec* omx = reinterpret_cast<omx_vdec*>(input);
-    unsigned char id;
-    int n;
-
-    fd_set readFds;
     int res = 0;
-    struct timeval tv;
 
     DEBUG_PRINT_HIGH("omx_vdec: message thread start");
     prctl(PR_SET_NAME, (unsigned long)"VideoDecMsgThread", 0, 0, 0);
     while (!omx->message_thread_stop) {
-
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
-
-        FD_ZERO(&readFds);
-        FD_SET(omx->m_pipe_in, &readFds);
-
-        res = select(omx->m_pipe_in + 1, &readFds, NULL, NULL, &tv);
-        if (res < 0) {
-            DEBUG_PRINT_ERROR("select() ERROR: %s", strerror(errno));
+        res = omx->signal.wait(2 * 1000000000);
+        if (res == ETIMEDOUT || omx->message_thread_stop) {
             continue;
-        } else if (res == 0 /*timeout*/ || omx->message_thread_stop) {
-            continue;
-        }
-
-        n = read(omx->m_pipe_in, &id, 1);
-
-        if (0 == n) {
+        } else if (res) {
+            DEBUG_PRINT_ERROR("omx_vdec: message_thread_dec wait on condition failed, exiting");
             break;
         }
-
-        if (1 == n) {
-            omx->process_event_cb(omx, id);
-        }
-
-        if ((n < 0) && (errno != EINTR)) {
-            DEBUG_PRINT_LOW("ERROR: read from pipe failed, ret %d errno %d", n, errno);
-            break;
-        }
+        omx->process_event_cb(omx);
     }
     DEBUG_PRINT_HIGH("omx_vdec: message thread stop");
     return 0;
@@ -408,14 +387,8 @@ void* message_thread_dec(void *input)
 
 void post_message(omx_vdec *omx, unsigned char id)
 {
-    int ret_value;
-    DEBUG_PRINT_LOW("omx_vdec: post_message %d pipe out%d", id,omx->m_pipe_out);
-    ret_value = write(omx->m_pipe_out, &id, 1);
-    if (ret_value <= 0) {
-        DEBUG_PRINT_ERROR("post_message to pipe failed : %s", strerror(errno));
-    } else {
-        DEBUG_PRINT_LOW("post_message to pipe done %d",ret_value);
-    }
+    DEBUG_PRINT_LOW("omx_vdec: post_message %d", id);
+    omx->signal.signal();
 }
 
 // omx_cmd_queue destructor
@@ -678,8 +651,6 @@ omx_vdec::omx_vdec(): m_error_propogated(false),
     m_is_display_session(false),
     m_buffer_error(false)
 {
-    m_pipe_in = -1;
-    m_pipe_out = -1;
     m_poll_efd = -1;
     drv_ctx.video_driver_fd = -1;
     drv_ctx.extradata_info.ion.fd_ion_data.fd = -1;
@@ -972,10 +943,6 @@ omx_vdec::~omx_vdec()
         DEBUG_PRINT_HIGH("Waiting on OMX Msg Thread exit");
         pthread_join(msg_thread_id,NULL);
     }
-    close(m_pipe_in);
-    close(m_pipe_out);
-    m_pipe_in = -1;
-    m_pipe_out = -1;
     DEBUG_PRINT_HIGH("Waiting on OMX Async Thread exit");
     if(eventfd_write(m_poll_efd, 1)) {
          DEBUG_PRINT_ERROR("eventfd_write failed for fd: %d, errno = %d, force stop async_thread", m_poll_efd, errno);
@@ -1441,7 +1408,7 @@ int omx_vdec::decide_downscalar()
    None.
 
    ========================================================================== */
-void omx_vdec::process_event_cb(void *ctxt, unsigned char id)
+void omx_vdec::process_event_cb(void *ctxt)
 {
     unsigned long p1; // Parameter - 1
     unsigned long p2; // Parameter - 2
@@ -1481,8 +1448,7 @@ void omx_vdec::process_event_cb(void *ctxt, unsigned char id)
 
         /*process message if we have one*/
         if (qsize > 0) {
-            id = ident;
-            switch (id) {
+            switch (ident) {
                 case OMX_COMPONENT_GENERATE_EVENT:
                     if (pThis->m_cb.EventHandler) {
                         switch (p1) {
@@ -2801,20 +2767,13 @@ OMX_ERRORTYPE omx_vdec::component_init(OMX_STRING role)
             }
         }
 
-        if (pipe(fds)) {
-            DEBUG_PRINT_ERROR("pipe creation failed");
-            eRet = OMX_ErrorInsufficientResources;
-        } else {
-            m_pipe_in = fds[0];
-            m_pipe_out = fds[1];
-            msg_thread_created = true;
-            r = pthread_create(&msg_thread_id,0,message_thread_dec,this);
+        msg_thread_created = true;
+        r = pthread_create(&msg_thread_id,0,message_thread_dec,this);
 
-            if (r < 0) {
-                DEBUG_PRINT_ERROR("component_init(): message_thread_dec creation failed");
-                msg_thread_created = false;
-                eRet = OMX_ErrorInsufficientResources;
-            }
+        if (r < 0) {
+            DEBUG_PRINT_ERROR("component_init(): message_thread_dec creation failed");
+            msg_thread_created = false;
+            eRet = OMX_ErrorInsufficientResources;
         }
     }
 
@@ -2827,6 +2786,18 @@ OMX_ERRORTYPE omx_vdec::component_init(OMX_STRING role)
     if (eRet != OMX_ErrorNone) {
         DEBUG_PRINT_ERROR("Component Init Failed");
     } else {
+#ifdef _MSM8996_AUTO_
+        /* allow ubwc linear event setting to support interlaced clips
+         * playback for linux and just print warning log to show the
+         * setting fail for non-linux PVM hypervisor case for playback
+         * doesn't depend on this */
+        control.id = V4L2_CID_MPEG_VIDC_VIDEO_ALLOW_UBWC_LINEAR_EVENT;
+        control.value = V4L2_MPEG_VIDC_VIDEO_ALLOW_UBWC_LINEAR_EVENT_ENABLE;
+        ret = ioctl(drv_ctx.video_driver_fd, VIDIOC_S_CTRL, &control);
+        if (ret)
+          DEBUG_PRINT_HIGH("Failed to set control for id=%d, value=%d\n",
+                  control.id, control.value);
+#endif
         DEBUG_PRINT_INFO("omx_vdec::component_init() success : fd=%d",
                 drv_ctx.video_driver_fd);
     }
@@ -9557,6 +9528,14 @@ int omx_vdec::async_message_process (void *context, void* message)
             DEBUG_PRINT_HIGH("Port settings changed");
             omx->m_reconfig_width = vdec_msg->msgdata.output_frame.picsize.frame_width;
             omx->m_reconfig_height = vdec_msg->msgdata.output_frame.picsize.frame_height;
+            if ((vdec_msg->msgdata.output_frame.interlaced_format == VDEC_InterlaceInterleaveFrameTopFieldFirst) ||
+                (vdec_msg->msgdata.output_frame.interlaced_format == VDEC_InterlaceInterleaveFrameBottomFieldFirst)) {
+                if (omx->drv_ctx.output_format != VDEC_YUV_FORMAT_NV12) {
+                    // if interlace mode, output buffer format must be NV12 linear
+                    omx->drv_ctx.output_format = VDEC_YUV_FORMAT_NV12;
+                    omx->capture_capability = V4L2_PIX_FMT_NV12;
+                }
+            }
             omx->post_event (OMX_CORE_OUTPUT_PORT_INDEX, OMX_IndexParamPortDefinition,
                     OMX_COMPONENT_GENERATE_PORT_RECONFIG);
             if (!omx->m_need_turbo) {
@@ -11115,7 +11094,8 @@ void omx_vdec::convert_color_space_info(OMX_U32 primaries, OMX_U32 range,
             aspects->mPrimaries = ColorAspects::PrimariesBT2020;
             break;
         case MSM_VIDC_UNSPECIFIED:
-            //Client does not expect ColorAspects::PrimariesUnspecified, but rather the supplied default
+            aspects->mPrimaries = ColorAspects::PrimariesUnspecified;
+            break;
         default:
             //aspects->mPrimaries = ColorAspects::PrimariesOther;
             aspects->mPrimaries = m_client_color_space.sAspects.mPrimaries;
@@ -11201,6 +11181,10 @@ bool omx_vdec::handle_color_space_info(void *data)
     ColorAspects tempAspects;
     memset(&tempAspects, 0x0, sizeof(ColorAspects));
     ColorAspects *aspects = &tempAspects;
+    aspects->mRange =  ColorAspects::RangeUnspecified;
+    aspects->mPrimaries = ColorAspects::PrimariesUnspecified;
+    aspects->mMatrixCoeffs = ColorAspects::MatrixUnspecified;
+    aspects->mTransfer = ColorAspects::TransferUnspecified;
 
     switch(output_capability) {
         case V4L2_PIX_FMT_MPEG2:
@@ -11229,7 +11213,8 @@ bool omx_vdec::handle_color_space_info(void *data)
                 display_info_payload = (struct msm_vidc_vui_display_info_payload*)data;
 
                 /* Refer H264 Spec @ Rec. ITU-T H.264 (02/2014) to understand this code */
-
+                aspects->mRange = display_info_payload->video_full_range_flag ?
+                    ColorAspects::RangeFull : ColorAspects::RangeLimited;
                 if (display_info_payload->video_signal_present_flag &&
                         display_info_payload->color_description_present_flag) {
                     convert_color_space_info(display_info_payload->color_primaries,
@@ -11344,6 +11329,11 @@ bool omx_vdec::handle_color_space_info(void *data)
             m_internal_color_space.sAspects.mTransfer != aspects->mTransfer ||
             m_internal_color_space.sAspects.mMatrixCoeffs != aspects->mMatrixCoeffs ||
             m_internal_color_space.sAspects.mRange != aspects->mRange) {
+        if (aspects->mPrimaries == ColorAspects::PrimariesUnspecified &&
+            aspects->mRange == ColorAspects::RangeFull) {
+            DEBUG_PRINT_LOW("ColorPrimaries is unspecified, defaulting to ColorPrimaries_BT601_6_525 before copying");
+            aspects->mPrimaries = ColorAspects::PrimariesBT601_6_525;
+        }
         memcpy(&(m_internal_color_space.sAspects), aspects, sizeof(ColorAspects));
 
         DEBUG_PRINT_HIGH("Initiating PORT Reconfig due to Color Aspects Change");
@@ -11463,6 +11453,10 @@ bool omx_vdec::handle_mastering_display_color_info(void* data)
 void omx_vdec::set_colormetadata_in_handle(ColorMetaData *color_mdata, unsigned int buf_index)
 {
     private_handle_t *private_handle = NULL;
+    if (color_mdata->colorPrimaries == (ColorPrimaries)2) {
+        DEBUG_PRINT_LOW("ColorPrimaries is unspecified, defaulting to ColorPrimaries_BT601_6_525 before setting");
+        color_mdata->colorPrimaries = ColorPrimaries_BT601_6_525;
+    }
     if (buf_index < drv_ctx.op_buf.actualcount &&
         buf_index < MAX_NUM_INPUT_OUTPUT_BUFFERS &&
         native_buffer[buf_index].privatehandle) {
